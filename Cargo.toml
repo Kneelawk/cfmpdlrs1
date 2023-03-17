@@ -1,0 +1,21 @@
+[package]
+name = "cfmpdlrs1"
+version = "0.1.0"
+edition = "2021"
+description = "Simple rust program for downloading CurseForge modpacks."
+authors = ["kneelawk <kneelawk@gmail.com>"]
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "^1.0"
+async_zip = { version = "0.0.12", features = ["full"] }
+clap = { version = "^4.1", features = ["derive"] }
+dotenv = "^0.15"
+reqwest = "^0.11"
+sanitize-filename = "^0.4"
+serde = { version = "^1.0", features = ["derive"] }
+thiserror = "^1.0"
+tokio = { version = "^1.26", features = ["full"] }
+tracing = "^0.1"
+tracing-subscriber = "^0.3"
