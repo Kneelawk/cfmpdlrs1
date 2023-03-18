@@ -31,7 +31,7 @@ pub struct JsonMod {
     pub categories: Vec<JsonCategory>,
     pub class_id: Option<u32>,
     pub authors: Vec<JsonModAuthor>,
-    pub logo: JsonModAsset,
+    pub logo: Option<JsonModAsset>,
     pub screenshots: Vec<JsonModAsset>,
     pub main_file_id: u32,
     pub latest_files: Vec<JsonFile>,

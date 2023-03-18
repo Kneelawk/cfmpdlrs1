@@ -768,32 +768,27 @@ async fn try_copy_mod<'a>(
     mods_dir: &Path,
     path: &Path,
 ) -> Option<&'a ManualFile> {
-    match hash_file(path).await {
-        Ok(hashes) => {
-            for file in manual_files {
-                if to_download.contains(&file.filename)
-                    && file.file_length == hashes.file_length
-                    && file.sha1.as_ref().is_none_or(|sha1| sha1 == &hashes.sha1)
-                    && file.md5.as_ref().is_none_or(|md5| md5 == &hashes.md5)
-                {
-                    let to_path = mods_dir.join(&file.filename);
+    if let Ok(hashes) = hash_file(path).await {
+        for file in manual_files {
+            if to_download.contains(&file.filename)
+                && file.file_length == hashes.file_length
+                && file.sha1.as_ref().is_none_or(|sha1| sha1 == &hashes.sha1)
+                && file.md5.as_ref().is_none_or(|md5| md5 == &hashes.md5)
+            {
+                let to_path = mods_dir.join(&file.filename);
 
-                    match tokio::fs::copy(path, &to_path).await {
-                        Ok(_) => {
-                            return Some(file);
-                        }
-                        Err(err) => {
-                            warn!(
-                                "Found correct file {} but failed to copy it: {:?}",
-                                &file.filename, err
-                            );
-                        }
+                match tokio::fs::copy(path, &to_path).await {
+                    Ok(_) => {
+                        return Some(file);
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Found correct file {} but failed to copy it: {:?}",
+                            &file.filename, err
+                        );
                     }
                 }
             }
-        }
-        Err(err) => {
-            warn!("Error hashing files: {:?}", err);
         }
     }
 
