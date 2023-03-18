@@ -10,23 +10,31 @@ extern crate tracing;
 extern crate anyhow;
 
 use crate::json::get_files::{JsonGetFilesRequest, JsonGetFilesResponse, JsonHashAlgo};
+use crate::json::get_mods::{JsonGetModsRequest, JsonGetModsResponse};
 use crate::json::manifest::JsonManifest;
-use crate::utils::ResultExt;
+use crate::utils::{OptionExt, ResultExt};
 use anyhow::Context;
 use async_zip::read::fs::ZipFileReader;
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use clap::Parser;
+use digest::{Digest, FixedOutput};
+use directories::UserDirs;
+use futures::executor::block_on;
 use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
+use md5::Md5;
+use notify::{RecursiveMode, Watcher};
 use reqwest::{Client, Url};
-use std::path::PathBuf;
+use sha1::Sha1;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs::File;
 use tokio::fs::OpenOptions;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
@@ -42,6 +50,11 @@ struct Args {
     /// Output location to store the downloaded modpack at.
     #[arg(short, long)]
     output: Option<PathBuf>,
+
+    /// Directories to look for manually-downloaded files in.
+    /// If empty, the user's `Downloads` directory is used.
+    #[arg(short, long)]
+    manual_dir: Vec<PathBuf>,
 }
 
 #[tokio::main]
@@ -49,7 +62,11 @@ async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
     tracing_subscriber::fmt::init();
 
-    let Args { file, output } = Args::parse();
+    let Args {
+        file,
+        output,
+        manual_dir: mut manual_dirs,
+    } = Args::parse();
 
     let curse_api_key = std::env::var("CURSE_API_TOKEN")
         .ok()
@@ -74,6 +91,24 @@ async fn main() -> anyhow::Result<()> {
                 .ok_or(anyhow!("Modpack file is missing .zip extension"))?,
         );
     let output_dir = output.unwrap_or(default_output);
+
+    if manual_dirs.is_empty() {
+        if let Some(user_dirs) = UserDirs::new() {
+            if let Some(downloads_path) = user_dirs.download_dir() {
+                manual_dirs.push(downloads_path.to_path_buf());
+            } else {
+                warn!(
+                    "No manual download dirs specified and the user has no Downloads dir! \
+                    This program will be unable to handle files that require a manual download."
+                );
+            }
+        } else {
+            warn!(
+                "No manual download dirs specified and a user could not be found! \
+                This program will be unable to handle files that require a manual download."
+            );
+        }
+    }
 
     info!("Opening Modpack: {:?}", &file);
     info!("Outputting to: {:?}", &output_dir);
@@ -123,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
         let automatic_files: Vec<_> = files
             .iter()
             .filter_map(|file| match file {
-                DownloadFile::Automatic(download) => Some(download),
+                DownloadFile::Automatic(download) => Some(download.clone()),
                 DownloadFile::Manual(_) => None,
             })
             .collect();
@@ -131,7 +166,7 @@ async fn main() -> anyhow::Result<()> {
             .iter()
             .filter_map(|file| match file {
                 DownloadFile::Automatic(_) => None,
-                DownloadFile::Manual(manual) => Some(manual),
+                DownloadFile::Manual(manual) => Some(manual.clone()),
             })
             .collect();
 
@@ -142,6 +177,23 @@ async fn main() -> anyhow::Result<()> {
         download_automatic_mods(client.clone(), &automatic_files, mods_dir.clone())
             .await
             .context("Error downloading automatic mods")?;
+
+        if manual_dirs.is_empty() && !manual_files.is_empty() {
+            error!(
+                "This modpack requires manual downloading of some files \
+                but no location was specified to search for said files. \
+                Please use the --manual-dir option to specify some."
+            );
+            bail!(
+                "This modpack requires manual downloading of some files \
+                but no location was specified to search for said files. \
+                Please use the --manual-dir option to specify some."
+            );
+        }
+
+        download_manual_mods(&manual_files, mods_dir.clone(), &manual_dirs)
+            .await
+            .context("Error manually downloading mods")?;
     }
 
     Ok(())
@@ -242,29 +294,19 @@ struct AutomaticFile {
     download_url: String,
     filename: String,
     file_length: u64,
-    sha1: Option<String>,
-    md5: Option<String>,
+    sha1: Option<Vec<u8>>,
+    md5: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
 struct ManualFile {
     file_id: u32,
     mod_id: u32,
-    filename: String,
-    file_length: u64,
-    sha1: Option<String>,
-    md5: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct BrowserFile {
-    file_id: u32,
-    mod_id: u32,
     browser_url: String,
     filename: String,
     file_length: u64,
-    sha1: Option<String>,
-    md5: Option<String>,
+    sha1: Option<Vec<u8>>,
+    md5: Option<Vec<u8>>,
 }
 
 async fn get_mod_data(
@@ -273,52 +315,142 @@ async fn get_mod_data(
     manifest: JsonManifest,
 ) -> anyhow::Result<Vec<DownloadFile>> {
     info!("Downloading mod data...");
-    let file_ids = manifest.files.iter().map(|file| file.file_id).collect();
 
-    let response = client
-        .post("https://api.curseforge.com/v1/mods/files")
-        .header("x-api-key", curse_api_key)
-        .json(&JsonGetFilesRequest { file_ids })
-        .send()
-        .await?;
+    let mods_res = {
+        let mod_ids = manifest.files.iter().map(|file| file.project_id).collect();
+        let response = client
+            .post("https://api.curseforge.com/v1/mods")
+            .header("x-api-key", curse_api_key)
+            .json(&JsonGetModsRequest { mod_ids })
+            .send()
+            .await
+            .context("Error getting mod project data")?;
 
-    info!("Got response: {}", response.status());
-    response.error_for_status_ref()?;
+        info!("Got mods response: {}", response.status());
+        response
+            .error_for_status_ref()
+            .context("Get mods endpoint returned a bad status code")?;
 
-    let files_res = response.json::<JsonGetFilesResponse>().await?;
+        response
+            .json::<JsonGetModsResponse>()
+            .await
+            .context("Error getting and parsing mods response body")?
+    };
+
+    info!(
+        "Modpack mods: {}, received mods: {}",
+        manifest.files.len(),
+        mods_res.data.len()
+    );
+
+    let disallowed_mods: HashSet<_> = mods_res
+        .data
+        .iter()
+        .filter_map(|m| {
+            if m.allow_mod_distribution == Some(false) {
+                Some(m.id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    let ids_2_slugs: HashMap<_, _> = mods_res
+        .data
+        .iter()
+        .map(|m| (m.id, m.slug.clone()))
+        .collect();
+
+    let files_res = {
+        let file_ids = manifest.files.iter().map(|file| file.file_id).collect();
+        let response = client
+            .post("https://api.curseforge.com/v1/mods/files")
+            .header("x-api-key", curse_api_key)
+            .json(&JsonGetFilesRequest { file_ids })
+            .send()
+            .await
+            .context("Error getting mod file data")?;
+
+        info!("Got files response: {}", response.status());
+        response
+            .error_for_status_ref()
+            .context("Get files endpoint returned a bad status code")?;
+
+        response
+            .json::<JsonGetFilesResponse>()
+            .await
+            .context("Error getting and parsing files response body")?
+    };
+
+    info!(
+        "Modpack files: {}, received files: {}",
+        manifest.files.len(),
+        files_res.data.len()
+    );
+
+    let mut file_ids = HashSet::new();
+
     let files: Vec<_> = files_res
         .data
         .iter()
+        .filter(|file| file_ids.insert(file.id))
         .map(|file| {
-            if let Some(ref download_url) = file.download_url && file.is_available {
+            let sha1 = file.hash(JsonHashAlgo::Sha1).and_then(|s| match hex::decode(s) {
+                Ok(vec) => Some(vec),
+                Err(err) => {
+                    warn!("Error decoding SHA1 file hash for {}: {:?}", &file.file_name, err);
+                    None
+                }
+            });
+            let md5 = file.hash(JsonHashAlgo::Md5).and_then(|s| match hex::decode(s) {
+                Ok(vec) => Some(vec),
+                Err(err) => {
+                    warn!("Error decoding MD5 file hash for {}: {:?}", &file.file_name, err);
+                    None
+                }
+            });
+            if let Some(ref download_url) = file.download_url && !disallowed_mods.contains(&file.mod_id) {
                 DownloadFile::Automatic(AutomaticFile {
                     download_url: download_url.clone(),
                     filename: file.file_name.clone(),
                     file_length: file.file_length,
-                    sha1: file.hash(JsonHashAlgo::Sha1).map(String::from),
-                    md5: file.hash(JsonHashAlgo::Md5).map(String::from),
+                    sha1,
+                    md5,
                 })
             } else {
                 DownloadFile::Manual(ManualFile {
                     file_id: file.id,
                     mod_id: file.mod_id,
+                    browser_url: format!(
+                        "https://www.curseforge.com/minecraft/mc-mods/{}/download/{}",
+                        ids_2_slugs.get(&file.mod_id).expect("File project id mismatch!"),
+                        file.id
+                    ),
                     filename: file.file_name.clone(),
                     file_length: file.file_length,
-                    sha1: file.hash(JsonHashAlgo::Sha1).map(String::from),
-                    md5: file.hash(JsonHashAlgo::Md5).map(String::from),
+                    sha1,
+                    md5,
                 })
             }
         })
         .collect();
+
+    info!(
+        "Modpack entries: {}, result entries: {}",
+        manifest.files.len(),
+        files.len()
+    );
+
     Ok(files)
 }
 
 async fn download_automatic_mods(
     client: Arc<Client>,
-    mods: &[&AutomaticFile],
+    mods: &[AutomaticFile],
     mods_path: PathBuf,
 ) -> anyhow::Result<()> {
-    info!("Downloading {} files automatically.", mods.len());
+    let total_mods = mods.len();
+
+    info!("Downloading {total_mods} files automatically.");
 
     // Lazy concurrency limiter
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS));
@@ -327,9 +459,7 @@ async fn download_automatic_mods(
     let files_complete = Arc::new(AtomicUsize::new(0));
     let mut futures = FuturesUnordered::<JoinHandle<anyhow::Result<()>>>::new();
 
-    let total_mods = mods.len();
-
-    for &file in mods {
+    for file in mods {
         let client = client.clone();
         let file = file.clone();
         let mods_path = mods_path.clone();
@@ -525,4 +655,178 @@ async fn download_file_part(
     }
 
     Ok(Ok(()))
+}
+
+async fn download_manual_mods(
+    manual_files: &[ManualFile],
+    mods_dir: PathBuf,
+    manual_dirs: &[PathBuf],
+) -> anyhow::Result<()> {
+    let total_mods = manual_files.len();
+    info!("Manually downloading {total_mods} mods.");
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+    let mut watcher = notify::recommended_watcher(move |res| {
+        block_on(tx.send(res)).ok();
+    })
+    .context("Error directory creating watcher")?;
+
+    for manual_dir in manual_dirs {
+        watcher
+            .watch(manual_dir, RecursiveMode::Recursive)
+            .with_context(|| format!("Error watching directory {:?}", manual_dir))?;
+    }
+
+    info!("Scanning existing files...");
+
+    let mut lengths = HashSet::new();
+    let mut to_download = HashSet::new();
+
+    for file in manual_files {
+        lengths.insert(file.file_length);
+        to_download.insert(file.filename.clone());
+    }
+
+    let walking_dirs = manual_dirs.to_vec();
+    let paths = tokio::task::spawn_blocking::<_, anyhow::Result<Vec<PathBuf>>>(move || {
+        let mut paths = vec![];
+
+        for manual_dir in walking_dirs.iter() {
+            for entry in walkdir::WalkDir::new(manual_dir) {
+                let dir_entry = entry?;
+                let metadata = dir_entry.metadata()?;
+                if lengths.contains(&metadata.len()) {
+                    paths.push(dir_entry.path().to_path_buf());
+                }
+            }
+        }
+
+        Ok(paths)
+    })
+    .await??;
+
+    let mut successful = 0usize;
+
+    for path in paths.iter() {
+        if let Some(file) = try_copy_mod(manual_files, &to_download, &mods_dir, path).await {
+            to_download.remove(&file.filename);
+            successful += 1;
+
+            info!("Found mod {}/{}: {}", successful, total_mods, file.filename);
+
+            if successful >= total_mods {
+                info!("Manually downloaded {} mods.", successful);
+                return Ok(());
+            }
+        }
+    }
+
+    info!("Please download the following mods:");
+    for file in manual_files {
+        if to_download.contains(&file.filename) {
+            info!("    {}", file.browser_url);
+        }
+    }
+
+    info!("To one of the following directories:");
+    for manual_dir in manual_dirs {
+        info!("    {}", manual_dir.to_string_lossy());
+    }
+
+    while let Some(res) = rx.recv().await {
+        let event = res.context("Error while watching")?;
+
+        if event.kind.is_create() || event.kind.is_modify() {
+            for path in event.paths.iter() {
+                if let Some(file) = try_copy_mod(manual_files, &to_download, &mods_dir, path).await
+                {
+                    to_download.remove(&file.filename);
+                    successful += 1;
+
+                    info!("Found mod {}/{}: {}", successful, total_mods, file.filename);
+
+                    if successful >= total_mods {
+                        info!("Manually downloaded {} mods.", successful);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+    }
+
+    error!(
+        "Stopped waiting for manually downloaded mods with {} mods remaining.",
+        total_mods - successful
+    );
+
+    Ok(())
+}
+
+async fn try_copy_mod<'a>(
+    manual_files: &'a [ManualFile],
+    to_download: &HashSet<String>,
+    mods_dir: &Path,
+    path: &Path,
+) -> Option<&'a ManualFile> {
+    match hash_file(path).await {
+        Ok(hashes) => {
+            for file in manual_files {
+                if to_download.contains(&file.filename)
+                    && file.file_length == hashes.file_length
+                    && file.sha1.as_ref().is_none_or(|sha1| sha1 == &hashes.sha1)
+                    && file.md5.as_ref().is_none_or(|md5| md5 == &hashes.md5)
+                {
+                    let to_path = mods_dir.join(&file.filename);
+
+                    match tokio::fs::copy(path, &to_path).await {
+                        Ok(_) => {
+                            return Some(file);
+                        }
+                        Err(err) => {
+                            warn!(
+                                "Found correct file {} but failed to copy it: {:?}",
+                                &file.filename, err
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            warn!("Error hashing files: {:?}", err);
+        }
+    }
+
+    None
+}
+
+struct FileHash {
+    file_length: u64,
+    sha1: Vec<u8>,
+    md5: Vec<u8>,
+}
+
+async fn hash_file(path: &Path) -> anyhow::Result<FileHash> {
+    let mut file = File::open(path).await?;
+    let metadata = file.metadata().await?;
+
+    let mut sha1 = Sha1::new();
+    let mut md5 = Md5::new();
+
+    let mut bytes = BytesMut::new();
+    let mut read = 0usize;
+
+    while (read as u64) < metadata.len() {
+        file.read_buf(&mut bytes).await?;
+        sha1.update(&bytes[..]);
+        md5.update(&bytes[..]);
+        read += bytes.len();
+        bytes.clear();
+    }
+
+    Ok(FileHash {
+        file_length: metadata.len(),
+        sha1: sha1.finalize_fixed().to_vec(),
+        md5: md5.finalize_fixed().to_vec(),
+    })
 }
