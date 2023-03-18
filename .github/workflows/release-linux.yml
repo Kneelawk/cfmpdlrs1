@@ -25,10 +25,14 @@ jobs:
           CURSE_API_TOKEN: ${{ secrets.CURSE_API_TOKEN }}
       - name: Strip binary
         run: strip target/release/cfmpdlrs1
+      - name: Make dist directory
+        run: mkdir dist
+      - name: Copy binary
+        run: cp target/release/cfmpdlrs1 dist/cfmpdlrs1-linux
       - name: Publish release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            target/release/cfmpdlrs1
+            dist/cfmpdlrs1-linux
         env:
           GITHUB_TOKEN: ${{ secrets.PUBLISH_TOKEN }}
